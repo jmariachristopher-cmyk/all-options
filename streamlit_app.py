@@ -78,12 +78,12 @@ INSTRUMENTS = {
                    "underlying_search": "SENSEX",      "underlying_exch": "BSE", "expiry_type": "Weekly",  "strikes_each_side": 10},
     # Stock options have a MUCH narrower liquid strike band than index options -
     # strikes far from ATM often exist in the instrument list but have never
-    # traded (no historical candle at all), which is what caused the earlier
-    # "No historical candle available for strike 1460.0" failure. Keep this
-    # smaller; raise it only if you confirm Godrejprop's chain is liquid
-    # further out than this.
+    # traded (no historical candle at all). fetch_option_data now probes
+    # outward from ATM and automatically stops at the real liquid edge on
+    # each side, so this is just the requested/ideal range, not a hard
+    # requirement - it will shrink itself gracefully if needed.
     "GODREJPROP": {"name": "GODREJPROP", "exch_seg": "NFO", "instrumenttype": "OPTSTK",
-                   "underlying_search": "GODREJPROP-EQ", "underlying_exch": "NSE", "expiry_type": "Monthly", "strikes_each_side": 5},
+                   "underlying_search": "GODREJPROP-EQ", "underlying_exch": "NSE", "expiry_type": "Monthly", "strikes_each_side": 10},
 }
 
 STRIKES_EACH_SIDE = 10
@@ -262,34 +262,70 @@ def fetch_option_data(master, sess, jwt_token, api_key, instrument_name, strikes
     atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
 
     margin = 2  # Boundary Line needs neighbours 2 strikes beyond the display range
-    lo, hi = atm_idx - (strikes_each_side + margin), atm_idx + (strikes_each_side + margin)
-    if lo < 0 or hi >= len(strikes):
-        raise RuntimeError(
-            f"Chain only has {len(strikes)} strikes - not enough for "
-            f"{strikes_each_side} + {margin} margin on each side."
-        )
+    requested_half = strikes_each_side + margin
 
-    window_strikes = strikes[lo:hi + 1]
-
-    ext_ce, ext_pe = [], []
-    for s in window_strikes:
+    def probe(idx):
+        """Try to fetch CE+PE previous close for strikes[idx]. Returns
+        (ce, pe) or None if the contract is missing or has never traded
+        (no historical candle at all - common far from ATM on stock options)."""
+        s = strikes[idx]
         ce_token = by_strike_type.get((s, "CE"))
         pe_token = by_strike_type.get((s, "PE"))
         if not ce_token or not pe_token:
-            raise RuntimeError(f"Missing CE/PE contract for strike {s}.")
+            return None
         ce_close = get_prev_close(sess, jwt_token, api_key, cfg["exch_seg"], ce_token)
         time.sleep(0.35)  # Angel One's historical API has a strict rate limit - pace requests
         pe_close = get_prev_close(sess, jwt_token, api_key, cfg["exch_seg"], pe_token)
         time.sleep(0.35)
         if ce_close is None or pe_close is None:
-            raise RuntimeError(
-                f"Strike {s} exists in the instrument list but has no historical "
-                f"candle at all (never traded - common for strikes far from ATM "
-                f"on stock options). Lower this instrument's 'strikes_each_side' "
-                f"in INSTRUMENTS and try again."
-            )
-        ext_ce.append(ce_close)
-        ext_pe.append(pe_close)
+            return None
+        return ce_close, pe_close
+
+    center = probe(atm_idx)
+    if center is None:
+        raise RuntimeError(f"The ATM strike itself ({strikes[atm_idx]}) has no historical data - something is off with this expiry/instrument.")
+
+    right = {}
+    for off in range(1, requested_half + 1):
+        i = atm_idx + off
+        if i >= len(strikes):
+            break
+        res = probe(i)
+        if res is None:
+            break
+        right[off] = res
+
+    left = {}
+    for off in range(1, requested_half + 1):
+        i = atm_idx - off
+        if i < 0:
+            break
+        res = probe(i)
+        if res is None:
+            break
+        left[off] = res
+
+    effective_half = min(len(left), len(right))
+    if effective_half < margin + 1:
+        raise RuntimeError(
+            f"Only found {effective_half} liquid strike(s) on each side of ATM "
+            f"({strikes[atm_idx]}) - not enough even for a minimal display with "
+            f"the required margin. This instrument's chain may be too illiquid "
+            f"this far out, or too close to expiry."
+        )
+
+    effective_strikes_each_side = effective_half - margin
+    shrunk = effective_strikes_each_side < strikes_each_side
+
+    window_strikes = ([strikes[atm_idx - off] for off in range(effective_half, 0, -1)]
+                       + [strikes[atm_idx]]
+                       + [strikes[atm_idx + off] for off in range(1, effective_half + 1)])
+    ext_ce = ([left[off][0] for off in range(effective_half, 0, -1)]
+              + [center[0]]
+              + [right[off][0] for off in range(1, effective_half + 1)])
+    ext_pe = ([left[off][1] for off in range(effective_half, 0, -1)]
+              + [center[1]]
+              + [right[off][1] for off in range(1, effective_half + 1)])
 
     expiry_display = datetime.strptime(expiry, "%d%b%Y").date().isoformat()
 
@@ -301,6 +337,9 @@ def fetch_option_data(master, sess, jwt_token, api_key, instrument_name, strikes
         "ext_strikes": window_strikes,
         "ext_ce": ext_ce,
         "ext_pe": ext_pe,
+        "requested_strikes_each_side": strikes_each_side,
+        "effective_strikes_each_side": effective_strikes_each_side,
+        "shrunk": shrunk,
     }
 
 
@@ -671,6 +710,13 @@ for name, cfg in INSTRUMENTS.items():
                 st.error(f"{name} failed: {e}")
             else:
                 st.success(f"{name}: expiry {chain['expiry']}, spot {chain['spot']}")
+                if chain["shrunk"]:
+                    st.warning(
+                        f"Requested {chain['requested_strikes_each_side']} strikes each side, but only "
+                        f"{chain['effective_strikes_each_side']} were liquid enough (had real trade history) "
+                        f"on the narrower side - the script below uses {chain['effective_strikes_each_side']} "
+                        f"per side so every zone is backed by real data."
+                    )
 
                 with st.expander(f"🔍 Raw fetched data for {name} - check this against Angel One's own option chain first", expanded=True):
                     m = chain["margin"]
@@ -712,6 +758,14 @@ if st.button("Fetch & Generate Combined Script"):
     else:
         combined_code = build_combined_pine_script(chains, expiry_types)
         st.success("All four fetched successfully.")
+
+        for name, chain in chains.items():
+            if chain["shrunk"]:
+                st.warning(
+                    f"{name}: requested {chain['requested_strikes_each_side']} strikes each side, but only "
+                    f"{chain['effective_strikes_each_side']} were liquid enough - using "
+                    f"{chain['effective_strikes_each_side']} per side for this instrument."
+                )
 
         for name, chain in chains.items():
             with st.expander(f"🔍 Raw fetched data for {name}"):
