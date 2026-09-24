@@ -71,13 +71,19 @@ MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScr
 # exch_seg = segment options trade in ("NFO" for NSE F&O, "BFO" for BSE F&O)
 INSTRUMENTS = {
     "NIFTY":      {"name": "NIFTY",      "exch_seg": "NFO", "instrumenttype": "OPTIDX",
-                   "underlying_search": "NIFTY 50",   "underlying_exch": "NSE", "expiry_type": "Weekly"},
+                   "underlying_search": "NIFTY 50",   "underlying_exch": "NSE", "expiry_type": "Weekly",  "strikes_each_side": 10},
     "BANKNIFTY":  {"name": "BANKNIFTY",  "exch_seg": "NFO", "instrumenttype": "OPTIDX",
-                   "underlying_search": "NIFTY BANK",  "underlying_exch": "NSE", "expiry_type": "Monthly"},
+                   "underlying_search": "NIFTY BANK",  "underlying_exch": "NSE", "expiry_type": "Monthly", "strikes_each_side": 10},
     "SENSEX":     {"name": "SENSEX",     "exch_seg": "BFO", "instrumenttype": "OPTIDX",
-                   "underlying_search": "SENSEX",      "underlying_exch": "BSE", "expiry_type": "Weekly"},
+                   "underlying_search": "SENSEX",      "underlying_exch": "BSE", "expiry_type": "Weekly",  "strikes_each_side": 10},
+    # Stock options have a MUCH narrower liquid strike band than index options -
+    # strikes far from ATM often exist in the instrument list but have never
+    # traded (no historical candle at all), which is what caused the earlier
+    # "No historical candle available for strike 1460.0" failure. Keep this
+    # smaller; raise it only if you confirm Godrejprop's chain is liquid
+    # further out than this.
     "GODREJPROP": {"name": "GODREJPROP", "exch_seg": "NFO", "instrumenttype": "OPTSTK",
-                   "underlying_search": "GODREJPROP-EQ", "underlying_exch": "NSE", "expiry_type": "Monthly"},
+                   "underlying_search": "GODREJPROP-EQ", "underlying_exch": "NSE", "expiry_type": "Monthly", "strikes_each_side": 5},
 }
 
 STRIKES_EACH_SIDE = 10
@@ -276,7 +282,12 @@ def fetch_option_data(master, sess, jwt_token, api_key, instrument_name, strikes
         pe_close = get_prev_close(sess, jwt_token, api_key, cfg["exch_seg"], pe_token)
         time.sleep(0.35)
         if ce_close is None or pe_close is None:
-            raise RuntimeError(f"No historical candle available for strike {s}.")
+            raise RuntimeError(
+                f"Strike {s} exists in the instrument list but has no historical "
+                f"candle at all (never traded - common for strikes far from ATM "
+                f"on stock options). Lower this instrument's 'strikes_each_side' "
+                f"in INSTRUMENTS and try again."
+            )
         ext_ce.append(ce_close)
         ext_pe.append(pe_close)
 
@@ -654,7 +665,7 @@ for name, cfg in INSTRUMENTS.items():
     if col2.button("Fetch & Generate", key=f"gen_{name}"):
         with st.spinner(f"Pulling {name} previous-close data from Angel One (this fetches each strike individually, may take a bit)..."):
             try:
-                chain = fetch_option_data(master, sess, st.session_state["jwt_token"], api_key, name, STRIKES_EACH_SIDE)
+                chain = fetch_option_data(master, sess, st.session_state["jwt_token"], api_key, name, cfg["strikes_each_side"])
                 pine_code = build_pine_script(name, cfg["expiry_type"], chain)
             except Exception as e:
                 st.error(f"{name} failed: {e}")
@@ -691,7 +702,7 @@ if st.button("Fetch & Generate Combined Script"):
     for name, cfg in INSTRUMENTS.items():
         with st.spinner(f"Pulling {name} previous-close data from Angel One..."):
             try:
-                chains[name] = fetch_option_data(master, sess, st.session_state["jwt_token"], api_key, name, STRIKES_EACH_SIDE)
+                chains[name] = fetch_option_data(master, sess, st.session_state["jwt_token"], api_key, name, cfg["strikes_each_side"])
                 expiry_types[name] = cfg["expiry_type"]
             except Exception as e:
                 failed.append(f"{name}: {e}")
